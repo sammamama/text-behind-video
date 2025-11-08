@@ -48,7 +48,7 @@ function VideoCard({ video, index }) {
       if (videoRef.current.duration > 0.5) {
         videoRef.current.currentTime = 0.5;
       } else {
-        video.current.currenTime = 0;
+        video.current.currentTime = 0;
       }
     }
   };

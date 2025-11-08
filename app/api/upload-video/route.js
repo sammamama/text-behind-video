@@ -3,10 +3,15 @@ import { requireAuth } from "@/lib/auth-helper";
 
 import { NextResponse } from "next/server";
 
+import path from 'path'
+import fs from 'fs'
+
 import { replicate } from "@/lib/replicate";
-import { transferVideoToS3 } from "@/lib/video-storage";
+import { transferVideoToS3, uploadToS3 } from "@/lib/video-storage";
 import { getPresignedUrl } from "@/lib/s3";
 import { prisma } from "@/lib/prisma";
+import { promisify } from "util";
+import { exec } from "child_process";
 
 export async function POST(req) {
   try {
@@ -23,6 +28,8 @@ export async function POST(req) {
     const duration = form.get("duration");
     const video = form.get("video");
     const thumbnailBlob = form.get("thumbnailBlob");
+
+    const execPromise = promisify(exec);
 
     if (!video) {
       return NextResponse.json(
@@ -68,7 +75,8 @@ export async function POST(req) {
       return NextResponse.json({ message: "Invalid S3 path" }, { status: 400 });
 
     const cloudfrontVideoUrl = process.env.CLOUDFRONT_URL + "/" + videoPath;
-    const cloudfrontThumbnailUrl = process.env.CLOUDFRONT_URL + "/" + thumbnailPath;
+    const cloudfrontThumbnailUrl =
+      process.env.CLOUDFRONT_URL + "/" + thumbnailPath;
 
     if (!videoPresignedUrl) {
       return NextResponse.json(
@@ -149,7 +157,7 @@ export async function POST(req) {
       where: { id: videoRecord.id },
       data: {
         status: "READY",
-        thumbnailUrl: cloudfrontThumbnailUrl
+        thumbnailUrl: cloudfrontThumbnailUrl,
       },
     });
 
@@ -220,62 +228,173 @@ export async function POST(req) {
 
         console.log("Processing completed successfully");
 
-        const { cloudfrontUrl, success, error } = await transferVideoToS3(
-          outputUrl,
-          auth.userId
-        );
+        const tempDir = path.join(process.cwd(), "temp");
+        await fs.promises.mkdir(tempDir, { recursive: true });
 
-        if (!success) {
-          await prisma.video.update({
-            where: {id: videoRecord.id},
-            data: {
-              noBgStatus: "FAILED"
+        // Poll for completion (max 5 minutes)
+        const maxAttempts = 100;
+        let attempts = 0;
+
+        while (attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          attempts++;
+
+          try {
+            const currentPrediction = await replicate.predictions.get(
+              prediction.id
+            );
+
+            console.log(
+              `Attempt ${attempts}: Status = ${currentPrediction.status}`
+            );
+
+            if (currentPrediction.status === "succeeded") {
+              // Extract output URL
+              let outputUrl;
+
+              if (typeof currentPrediction.output === "string") {
+                outputUrl = currentPrediction.output;
+              } else if (
+                currentPrediction.output &&
+                currentPrediction.output.url
+              ) {
+                outputUrl = currentPrediction.output.url;
+              } else if (
+                Array.isArray(currentPrediction.output) &&
+                currentPrediction.output.length > 0
+              ) {
+                outputUrl =
+                  typeof currentPrediction.output[0] === "string"
+                    ? currentPrediction.output[0]
+                    : currentPrediction.output[0]?.url;
+              }
+
+              if (!outputUrl) {
+                throw new Error("No output URL in prediction result");
+              }
+
+              console.log(
+                "Processing completed successfully. Output URL:",
+                outputUrl
+              );
+              console.log("Removing green screen...");
+
+              const tempOutputPath = path.join(
+                tempDir,
+                `transparent-${Date.now()}.webm`
+              );
+
+              try {
+                let inputSource = outputUrl;
+
+                const command = `ffmpeg -y -i "${inputSource}" -vf "colorkey=0x6ceb97:0.17:0.15,despill=green:mix=0.5" -c:v libvpx-vp9 -pix_fmt yuva420p -b:v 2M -auto-alt-ref 0 "${tempOutputPath}"`;
+
+                console.log("Running FFmpeg command...");
+                const { stderr } = await execPromise(command);
+                console.log("FFmpeg completed:", stderr);
+
+                // Verify file was created and has content
+                const stats = await fs.promises.stat(tempOutputPath);
+                if (stats.size === 0) {
+                  throw new Error("Output file is empty");
+                }
+                console.log(`Transparent video created: ${stats.size} bytes`);
+
+                // Read file for S3 upload
+                const transparentVideoBuffer = await fs.promises.readFile(
+                  tempOutputPath
+                );
+
+                console.log("Uploading to S3...");
+                const { cloudfrontUrl, success, error } = await uploadToS3(
+                  transparentVideoBuffer,
+                  auth.userId,
+                  "video/webm"
+                );
+
+                // Clean up temp file
+                await fs.promises.unlink(tempOutputPath).catch((err) => {
+                  console.error("Failed to delete temp file:", err);
+                });
+
+                if (!success) {
+                  await prisma.video.update({
+                    where: { id: videoRecord.id },
+                    data: {
+                      noBgStatus: "FAILED",
+                    },
+                  });
+
+                  throw new Error(`S3 upload failed: ${error}`);
+                }
+
+                console.log("S3 upload successful:", cloudfrontUrl);
+
+                // Update database with completed status
+                await prisma.video.update({
+                  where: { id: videoRecord.id },
+                  data: {
+                    noBgStatus: "COMPLETED",
+                    noBgUrl: cloudfrontUrl,
+                  },
+                });
+
+                console.log("Database updated successfully");
+
+                // SUCCESS - break out of polling loop
+                return NextResponse.json({message: "success"}, {status: 200});
+              } catch (ffmpegError) {
+                console.error("Error in FFmpeg/S3 pipeline:", ffmpegError);
+
+                // Clean up temp file if it exists
+                await fs.promises.unlink(tempOutputPath).catch(() => {});
+
+                // Update database to FAILED status
+                await prisma.video
+                  .update({
+                    where: { id: videoRecord.id },
+                    data: {
+                      noBgStatus: "FAILED",
+                    },
+                  })
+                  .catch(console.error);
+
+                throw ffmpegError;
+              }
+            } else if (currentPrediction.status === "failed") {
+              // Replicate processing failed
+              await prisma.video
+                .update({
+                  where: { id: videoRecord.id },
+                  data: {
+                    noBgStatus: "FAILED",
+                  },
+                })
+                .catch(console.error);
+
+              throw new Error("Replicate prediction failed");
             }
-          })
-
-          throw new Error(`S3 transfer failed ${error}`);
+            // If still processing, continue polling
+          } catch (pollError) {
+            console.error("Error during polling:", pollError);
+            throw pollError;
+          }
         }
 
-        // Update database with completed status
-        await prisma.video.update({
-          where: { id: videoRecord.id },
-          data: {
-            noBgStatus: "COMPLETED",
-            noBgUrl: cloudfrontUrl,
-          },
-        });
+        // If we exit the loop without success
+        if (attempts >= maxAttempts) {
+          await prisma.video
+            .update({
+              where: { id: videoRecord.id },
+              data: {
+                noBgStatus: "FAILED",
+              },
+            })
+            .catch(console.error);
 
-        return NextResponse.json({
-          success: true,
-          status: "COMPLETED",
-          noBgUrl: cloudfrontUrl,
-          videoId: videoRecord.id,
-          message: "Background removed successfully",
-        });
-      } else if (
-        prediction.status === "failed" ||
-        prediction.status === "canceled"
-      ) {
-        // Update database with failed status
-        await prisma.video.update({
-          where: { id: videoRecord.id },
-          data: {
-            noBgStatus: "FAILED",
-          }
-        });
-
-        console.error("Processing failed:", prediction.error);
-
-        return NextResponse.json(
-          {
-            success: false,
-            status: "FAILED",
-            error: prediction.error || `Processing ${prediction.status}`,
-          },
-          { status: 500 }
-        );
+          throw new Error("Prediction timed out after 5 minutes");
+        }
       }
-      // If status is "starting" or "processing", continue polling
     }
 
     // Timeout - took too long
@@ -298,7 +417,7 @@ export async function POST(req) {
   } catch (error) {
     console.error("Error:", error);
   }
-  
+
   return NextResponse.json(
     {
       message: "Successfully uploaded",
