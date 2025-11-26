@@ -4,3 +4,8 @@ export const ALLOWED_VIDEO_TYPES = [
   'video/*',
   'image/gif'
 ]
+
+export const DEFAULT_TEXT='edit';
+export const MAX_FONT_SIZE=420
+export const MIN_FONT_SIZE=15
+export const DEFAULT_COLOR="#FFFFFF"

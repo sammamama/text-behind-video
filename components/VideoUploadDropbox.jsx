@@ -33,14 +33,15 @@ export default function VideoUploadDropbox() {
     return { valid: true };
   };
 
-  const checkVideoDuration = (file) => {
+  const checkVideoProperties = (file) => {
     return new Promise((resolve, reject) => {
       const video = document.createElement("video");
       video.preload = "metadata";
 
       video.onloadedmetadata = () => {
         window.URL.revokeObjectURL(video.src);
-        resolve(video.duration);
+
+        resolve({duration: video.duration, height: video.videoHeight, width: video.videoWidth});
       };
 
       video.onerror = () => {
@@ -122,7 +123,7 @@ export default function VideoUploadDropbox() {
     }
 
     try {
-      const duration = await checkVideoDuration(file);
+      const {duration, height, width} = await checkVideoProperties(file);
 
       if (duration > MAX_VIDEO_DURATION) {
         const errorFile = {
@@ -242,6 +243,8 @@ export default function VideoUploadDropbox() {
       const form = new FormData();
       form.append("video", currentFile.file);
       form.append("duration", currentFile.duration);
+      form.append("height", currentFile.height);
+      form.append("width", currentFile.width);
       form.append("size", currentFile.size);
       form.append("thumbnailBlob", currentFile.thumbnailBlob);
 

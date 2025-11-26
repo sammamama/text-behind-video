@@ -1,6 +1,17 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+@layer utilities {
+  .no-scrollbar::-webkit-outer-spin-button,
+  .no-scrollbar::-webkit-inner-spin-button{
+    display: none
+  }
+
+  .no-scrollbar{
+    -ms-overflow-style: none;
+  }
+}
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {

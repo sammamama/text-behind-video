@@ -26,6 +26,8 @@ export async function POST(req) {
     // Get form data
     const form = await req.formData();
     const duration = form.get("duration");
+    const height = form.get("height", currentFile.height);
+    const width= form.get("width", currentFile.width);
     const video = form.get("video");
     const thumbnailBlob = form.get("thumbnailBlob");
 
@@ -98,6 +100,8 @@ export async function POST(req) {
         userId: userId,
         url: cloudfrontVideoUrl,
         duration: duration,
+        width,
+        height,
         status: "PROCESSING",
       },
     });
